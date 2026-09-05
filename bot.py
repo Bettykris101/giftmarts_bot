@@ -378,8 +378,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     cleanup_temp_files(str(input_file))
                     return
                 
-                # Send frames as images
-                for i, frame_path in enumerate(frames):
+                # Send frames as images (limit to 10 to avoid spam)
+                for i, frame_path in enumerate(frames[:10]):
                     with open(frame_path, 'rb') as f:
                         caption = f"Frame {i+1}/{len(frames)}" if i == 0 else None
                         await context.bot.send_photo(
@@ -388,8 +388,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                             caption=caption if i == 0 else None
                         )
                 
-                # If more frames, send as zip
-                if len(frames) > 20:
+                # If more than 10 frames, send as zip
+                if len(frames) > 10:
                     zip_path = TEMP_DIR / f"{user_id}_frames.zip"
                     with zipfile.ZipFile(zip_path, 'w') as zipf:
                         for frame_path in frames:
@@ -494,9 +494,9 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     
-    # Add file handler
+    # Add file handler with correct filters
     application.add_handler(MessageHandler(
-        filters.Document.VIDEO | filters.Document.ANIMATION | filters.VIDEO | filters.ANIMATION,
+        filters.VIDEO | filters.ANIMATION | filters.Document.VIDEO,
         handle_file
     ))
     
