@@ -5,10 +5,11 @@ import shutil
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-import cv2
 from PIL import Image
 import imageio
 import numpy as np
+from moviepy.editor import VideoFileClip
+import zipfile
 
 # Enable logging
 logging.basicConfig(
@@ -29,44 +30,42 @@ def cleanup_temp_files(file_path):
     """Remove temporary files"""
     try:
         if os.path.exists(file_path):
-            os.remove(file_path)
+            if os.path.isdir(file_path):
+                shutil.rmtree(file_path, ignore_errors=True)
+            else:
+                os.remove(file_path)
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
 
-def video_to_gif(video_path, output_path, fps=10, width=None, height=None):
-    """Convert video to GIF using OpenCV and imageio"""
+def video_to_gif(video_path, output_path, fps=10, max_frames=100):
+    """Convert video to GIF using moviepy and imageio"""
     try:
-        # Read video
-        cap = cv2.VideoCapture(video_path)
-        frames = []
+        # Load video
+        clip = VideoFileClip(video_path)
         
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        # Reduce duration if too long (max 60 seconds)
+        if clip.duration > 60:
+            clip = clip.subclip(0, 60)
+        
+        # Resize if too large (max 480p)
+        if clip.size[0] > 480 or clip.size[1] > 480:
+            clip = clip.resize(height=480)
+        
+        # Extract frames
+        frames = []
+        frame_count = min(int(clip.duration * fps), max_frames)
+        
+        for t in range(frame_count):
+            frame = clip.get_frame(t / fps)
             frames.append(frame)
-        cap.release()
+        
+        clip.close()
         
         if not frames:
             return None, "No frames extracted from video"
         
-        # Resize if needed
-        if width and height:
-            frames = [cv2.resize(frame, (width, height)) for frame in frames]
-        elif width or height:
-            # Maintain aspect ratio if only one dimension specified
-            h, w = frames[0].shape[:2]
-            if width:
-                ratio = width / w
-                new_h = int(h * ratio)
-                frames = [cv2.resize(frame, (width, new_h)) for frame in frames]
-            elif height:
-                ratio = height / h
-                new_w = int(w * ratio)
-                frames = [cv2.resize(frame, (new_w, height)) for frame in frames]
-        
-        # Convert BGR to RGB
-        frames = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in frames]
+        # Convert to uint8
+        frames = [np.array(frame, dtype=np.uint8) for frame in frames]
         
         # Save as GIF
         imageio.mimsave(output_path, frames, fps=fps)
@@ -76,13 +75,16 @@ def video_to_gif(video_path, output_path, fps=10, width=None, height=None):
         logger.error(f"Video to GIF error: {e}")
         return None, str(e)
 
-def gif_to_frames(gif_path, output_dir, format="png"):
+def gif_to_frames(gif_path, output_dir, format="png", max_frames=50):
     """Extract frames from GIF to images"""
     try:
         gif = Image.open(gif_path)
         frames = []
         
-        for frame_idx in range(gif.n_frames):
+        # Limit to max_frames
+        total_frames = min(gif.n_frames, max_frames)
+        
+        for frame_idx in range(total_frames):
             gif.seek(frame_idx)
             frame = gif.copy()
             
@@ -94,6 +96,7 @@ def gif_to_frames(gif_path, output_dir, format="png"):
             frame.save(frame_path, format.upper())
             frames.append(frame_path)
         
+        gif.close()
         return frames, None
     except Exception as e:
         logger.error(f"GIF to frames error: {e}")
@@ -120,13 +123,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🔄 *Commands:*\n"
         f"/start - Show this menu\n"
         f"/help - More details\n"
-        f"/settings - Change conversion settings"
+        f"/cancel - Cancel current operation"
     )
     
     keyboard = [
         [InlineKeyboardButton("🎥 Convert Video to GIF", callback_data="video_to_gif")],
         [InlineKeyboardButton("🎞️ Convert GIF to Images", callback_data="gif_to_images")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
         [InlineKeyboardButton("❓ Help", callback_data="help")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -150,11 +152,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     file_obj = None
     file_type = None
     file_name = None
+    mime_type = None
     
-    if document and (document.file_name and (document.file_name.lower().endswith(('.gif', '.mp4', '.avi', '.mov', '.mkv', '.webm')) or document.mime_type and 'video' in document.mime_type)):
-        file_obj = document
-        file_type = "document"
-        file_name = document.file_name
+    if document:
+        file_name = document.file_name or "file"
+        mime_type = document.mime_type or ""
+        if file_name.lower().endswith(('.gif', '.mp4', '.avi', '.mov', '.mkv', '.webm')) or 'video' in mime_type:
+            file_obj = document
+            file_type = "document"
     elif video:
         file_obj = video
         file_type = "video"
@@ -188,9 +193,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     
     # Show conversion options
     keyboard = []
-    if file_type in ["video", "document"] and file_name.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm')):
+    if file_type in ["video", "document"]:
         keyboard.append([InlineKeyboardButton("🎥 Convert to GIF", callback_data="convert_to_gif")])
-    elif file_type == "gif" or (document and file_name.lower().endswith('.gif')):
+    elif file_type == "gif":
         keyboard.append([InlineKeyboardButton("🎞️ Extract Frames to Images", callback_data="convert_to_images")])
     
     keyboard.append([InlineKeyboardButton("🔄 Cancel", callback_data="cancel")])
@@ -230,23 +235,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "📤 *Send me a GIF file!*\n\n"
             "I'll extract all frames as images for you! 🎞️➡️🖼️\n\n"
             "✨ *Tip:* For better quality, send large GIF files.",
-            parse_mode="Markdown"
-        )
-        return
-    
-    elif query.data == "settings":
-        settings_text = (
-            "⚙️ *Settings*\n\n"
-            "You can customize:\n"
-            "• GIF quality (FPS)\n"
-            "• Output image format\n"
-            "• Frame extraction limit\n\n"
-            "🔜 This feature is coming soon!"
-        )
-        keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-        await query.edit_message_text(
-            settings_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
         return
@@ -319,48 +307,47 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             file = await context.bot.get_file(file_id)
             
             # Create temp files
-            input_path = TEMP_DIR / f"{user_id}_input.{file_name.split('.')[-1] if '.' in file_name else 'file'}"
+            input_path = TEMP_DIR / f"{user_id}_input"
             output_dir = TEMP_DIR / f"{user_id}_output"
             output_dir.mkdir(exist_ok=True)
             
-            # Download file
-            await file.download_to_drive(input_path)
+            # Download file with proper extension
+            ext = file_name.split('.')[-1] if '.' in file_name else 'file'
+            input_file = TEMP_DIR / f"{user_id}_input.{ext}"
+            await file.download_to_drive(input_file)
             
             if query.data == "convert_to_gif":
                 # Video to GIF
                 output_path = TEMP_DIR / f"{user_id}_output.gif"
                 
-                # Determine if we need to extract frames
-                if file_type == "video":
-                    # Video to GIF
-                    result, error = video_to_gif(str(input_path), str(output_path), fps=10)
-                    if error:
-                        await query.edit_message_text(
-                            f"❌ *Conversion failed!*\n\n"
-                            f"Error: {error[:200]}\n\n"
-                            f"Please try again or contact support.",
-                            parse_mode="Markdown"
-                        )
-                        cleanup_temp_files(str(input_path))
-                        return
-                    
-                    # Send the GIF
-                    with open(output_path, 'rb') as f:
-                        await context.bot.send_document(
-                            chat_id=update.effective_chat.id,
-                            document=f,
-                            filename=f"{file_name.split('.')[0]}.gif",
-                            caption="🎉 *Here's your GIF!* 🎉\n\nConverted from video successfully!",
-                            parse_mode="Markdown"
-                        )
+                result, error = video_to_gif(str(input_file), str(output_path))
+                if error:
+                    await query.edit_message_text(
+                        f"❌ *Conversion failed!*\n\n"
+                        f"Error: {error[:200]}\n\n"
+                        f"Please try again or contact support.",
+                        parse_mode="Markdown"
+                    )
+                    cleanup_temp_files(str(input_file))
+                    return
+                
+                # Send the GIF
+                with open(output_path, 'rb') as f:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=f,
+                        filename=f"{os.path.splitext(file_name)[0]}.gif",
+                        caption="🎉 *Here's your GIF!* 🎉\n\nConverted from video successfully!",
+                        parse_mode="Markdown"
+                    )
                 
                 # Cleanup
-                cleanup_temp_files(str(input_path))
+                cleanup_temp_files(str(input_file))
                 cleanup_temp_files(str(output_path))
                 shutil.rmtree(str(output_dir), ignore_errors=True)
-                del user_sessions[user_id]
+                if user_id in user_sessions:
+                    del user_sessions[user_id]
                 
-                # Send success message
                 await query.edit_message_text(
                     "✅ *Conversion complete!*\n\n"
                     "🎬 Video → GIF ✅\n"
@@ -371,7 +358,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 
             elif query.data == "convert_to_images":
                 # GIF to Images
-                frames, error = gif_to_frames(str(input_path), str(output_dir), "png")
+                frames, error = gif_to_frames(str(input_file), str(output_dir), "png")
                 if error:
                     await query.edit_message_text(
                         f"❌ *Extraction failed!*\n\n"
@@ -379,12 +366,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         f"Please try again or contact support.",
                         parse_mode="Markdown"
                     )
-                    cleanup_temp_files(str(input_path))
+                    cleanup_temp_files(str(input_file))
                     return
                 
-                # Send frames as a photo album
-                media_group = []
-                for i, frame_path in enumerate(frames[:20]):  # Limit to 20 frames
+                if not frames:
+                    await query.edit_message_text(
+                        "❌ *No frames extracted!*\n\n"
+                        "The GIF might be empty or corrupted.",
+                        parse_mode="Markdown"
+                    )
+                    cleanup_temp_files(str(input_file))
+                    return
+                
+                # Send frames as images
+                for i, frame_path in enumerate(frames):
                     with open(frame_path, 'rb') as f:
                         caption = f"Frame {i+1}/{len(frames)}" if i == 0 else None
                         await context.bot.send_photo(
@@ -393,9 +388,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                             caption=caption if i == 0 else None
                         )
                 
-                # If more than 20 frames, send as zip
+                # If more frames, send as zip
                 if len(frames) > 20:
-                    import zipfile
                     zip_path = TEMP_DIR / f"{user_id}_frames.zip"
                     with zipfile.ZipFile(zip_path, 'w') as zipf:
                         for frame_path in frames:
@@ -405,7 +399,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         await context.bot.send_document(
                             chat_id=update.effective_chat.id,
                             document=f,
-                            filename=f"{file_name.split('.')[0]}_frames.zip",
+                            filename=f"{os.path.splitext(file_name)[0]}_frames.zip",
                             caption=f"📦 *All {len(frames)} frames* in a zip file!",
                             parse_mode="Markdown"
                         )
@@ -413,11 +407,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     cleanup_temp_files(str(zip_path))
                 
                 # Cleanup
-                cleanup_temp_files(str(input_path))
+                cleanup_temp_files(str(input_file))
                 shutil.rmtree(str(output_dir), ignore_errors=True)
-                for frame in frames:
-                    cleanup_temp_files(frame)
-                del user_sessions[user_id]
+                if user_id in user_sessions:
+                    del user_sessions[user_id]
                 
                 await query.edit_message_text(
                     "✅ *Extraction complete!*\n\n"
@@ -444,7 +437,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🎬 *Media Converter Bot Help*\n\n"
         "📋 *Commands:*\n"
         "• /start - Start the bot\n"
-        "• /help - Show this help\n\n"
+        "• /help - Show this help\n"
+        "• /cancel - Cancel current operation\n\n"
         "🎥 *Video → GIF:*\n"
         "1. Send a video file\n"
         "2. Click 'Convert to GIF'\n"
