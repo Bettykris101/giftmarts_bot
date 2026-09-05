@@ -1,7 +1,14 @@
 import os
 import logging
+import tempfile
+import shutil
+from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import cv2
+from PIL import Image
+import imageio
+import numpy as np
 
 # Enable logging
 logging.basicConfig(
@@ -10,205 +17,480 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Inventory data - You can update this anytime
-INVENTORY = {
-    "gaming": {
-        "name": "🎮 Gaming Cards",
-        "items": [
-            "🎮 PlayStation Store ($10) - ✅ In Stock",
-            "🎮 Xbox Gift Card ($25) - ✅ In Stock", 
-            "🎮 Steam Wallet ($50) - ✅ In Stock",
-            "🎮 Nintendo eShop ($20) - ⚠️ Low Stock",
-            "🎮 Roblox Gift Card - ✅ In Stock"
-        ]
-    },
-    "entertainment": {
-        "name": "🎬 Entertainment & Streaming",
-        "items": [
-            "🎬 Netflix Gift Card - ✅ In Stock",
-            "🎬 Spotify Premium - ✅ In Stock",
-            "🎬 Disney+ Subscription - ✅ In Stock",
-            "🎬 Hulu Gift Card - ❌ Out of Stock",
-            "🎬 Apple Music - ✅ In Stock"
-        ]
-    },
-    "retail": {
-        "name": "🛍️ Retail & Shopping",
-        "items": [
-            "🛍️ Amazon Gift Card - ✅ In Stock",
-            "🛍️ Walmart eGift Card - ✅ In Stock",
-            "🛍️ Target GiftCard - ✅ In Stock",
-            "🛍️ Best Buy Gift Card - ⚠️ Low Stock",
-            "🛍️ eBay Gift Card - ✅ In Stock"
-        ]
-    }
-}
+# Ensure temp directory exists
+TEMP_DIR = Path("temp_files")
+TEMP_DIR.mkdir(exist_ok=True)
 
+# User session storage (simple in-memory)
+user_sessions = {}
+
+# Helper Functions
+def cleanup_temp_files(file_path):
+    """Remove temporary files"""
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
+
+def video_to_gif(video_path, output_path, fps=10, width=None, height=None):
+    """Convert video to GIF using OpenCV and imageio"""
+    try:
+        # Read video
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(frame)
+        cap.release()
+        
+        if not frames:
+            return None, "No frames extracted from video"
+        
+        # Resize if needed
+        if width and height:
+            frames = [cv2.resize(frame, (width, height)) for frame in frames]
+        elif width or height:
+            # Maintain aspect ratio if only one dimension specified
+            h, w = frames[0].shape[:2]
+            if width:
+                ratio = width / w
+                new_h = int(h * ratio)
+                frames = [cv2.resize(frame, (width, new_h)) for frame in frames]
+            elif height:
+                ratio = height / h
+                new_w = int(w * ratio)
+                frames = [cv2.resize(frame, (new_w, height)) for frame in frames]
+        
+        # Convert BGR to RGB
+        frames = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in frames]
+        
+        # Save as GIF
+        imageio.mimsave(output_path, frames, fps=fps)
+        
+        return output_path, None
+    except Exception as e:
+        logger.error(f"Video to GIF error: {e}")
+        return None, str(e)
+
+def gif_to_frames(gif_path, output_dir, format="png"):
+    """Extract frames from GIF to images"""
+    try:
+        gif = Image.open(gif_path)
+        frames = []
+        
+        for frame_idx in range(gif.n_frames):
+            gif.seek(frame_idx)
+            frame = gif.copy()
+            
+            # Convert to RGB if needed
+            if frame.mode != 'RGB':
+                frame = frame.convert('RGB')
+            
+            frame_path = os.path.join(output_dir, f"frame_{frame_idx+1:03d}.{format}")
+            frame.save(frame_path, format.upper())
+            frames.append(frame_path)
+        
+        return frames, None
+    except Exception as e:
+        logger.error(f"GIF to frames error: {e}")
+        return None, str(e)
+
+# Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send welcome message with main menu buttons."""
+    """Send welcome message"""
     user = update.effective_user
     
     welcome_text = (
-        f"👋 *Hi {user.first_name}!*\n\n"
-        "🏪 *Welcome to the Giftmart Catalog!*\n"
-        "Use the menu buttons below to browse authentic, officially licensed "
-        "digital gift cards for gaming, streaming, and retail shopping.\n\n"
-        "📦 *Please choose a category to check live stock:*"
+        f"🎬 *Hi {user.first_name}! Welcome to Media Converter Bot!*\n\n"
+        f"I can convert:\n"
+        f"🎥 Video → GIF\n"
+        f"🎞️ GIF → Images\n\n"
+        f"*How to use:*\n"
+        f"1. Send me a video or GIF file\n"
+        f"2. Choose your conversion option\n"
+        f"3. Wait for the magic! ✨\n\n"
+        f"⚠️ *Limits:*\n"
+        f"• Max file size: 50MB\n"
+        f"• Video length: Max 60 seconds\n"
+        f"• GIF frames: Max 50\n\n"
+        f"🔄 *Commands:*\n"
+        f"/start - Show this menu\n"
+        f"/help - More details\n"
+        f"/settings - Change conversion settings"
     )
     
-    # Create inline keyboard with buttons
     keyboard = [
-        [InlineKeyboardButton("🎮 Gaming Cards", callback_data="gaming")],
-        [InlineKeyboardButton("🎬 Entertainment & Streaming", callback_data="entertainment")],
-        [InlineKeyboardButton("🛍️ Retail & Shopping", callback_data="retail")],
-        [InlineKeyboardButton("📊 View All Categories", callback_data="all_categories")]
+        [InlineKeyboardButton("🎥 Convert Video to GIF", callback_data="video_to_gif")],
+        [InlineKeyboardButton("🎞️ Convert GIF to Images", callback_data="gif_to_images")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+        [InlineKeyboardButton("❓ Help", callback_data="help")]
     ]
-    
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        welcome_text, 
+        welcome_text,
         reply_markup=reply_markup,
         parse_mode="Markdown"
     )
 
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle incoming video or GIF files"""
+    user = update.effective_user
+    user_id = str(user.id)
+    
+    # Check if it's a video or GIF
+    document = update.message.document
+    video = update.message.video
+    animation = update.message.animation
+    
+    file_obj = None
+    file_type = None
+    file_name = None
+    
+    if document and (document.file_name and (document.file_name.lower().endswith(('.gif', '.mp4', '.avi', '.mov', '.mkv', '.webm')) or document.mime_type and 'video' in document.mime_type)):
+        file_obj = document
+        file_type = "document"
+        file_name = document.file_name
+    elif video:
+        file_obj = video
+        file_type = "video"
+        file_name = f"{user_id}_video.mp4"
+    elif animation:
+        file_obj = animation
+        file_type = "gif"
+        file_name = f"{user_id}_animation.gif"
+    else:
+        await update.message.reply_text(
+            "❌ Please send a video file (MP4, AVI, MOV, MKV, WEBM) or GIF.\n\n"
+            "I support most video formats and animated GIFs!"
+        )
+        return
+    
+    # Check file size (50MB limit)
+    if file_obj.file_size > 50 * 1024 * 1024:
+        await update.message.reply_text(
+            "❌ File is too large! Maximum size is 50MB.\n"
+            "Please compress your file and try again."
+        )
+        return
+    
+    # Store file info in user session
+    user_sessions[user_id] = {
+        "file_id": file_obj.file_id,
+        "file_type": file_type,
+        "file_name": file_name,
+        "file_size": file_obj.file_size
+    }
+    
+    # Show conversion options
+    keyboard = []
+    if file_type in ["video", "document"] and file_name.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm')):
+        keyboard.append([InlineKeyboardButton("🎥 Convert to GIF", callback_data="convert_to_gif")])
+    elif file_type == "gif" or (document and file_name.lower().endswith('.gif')):
+        keyboard.append([InlineKeyboardButton("🎞️ Extract Frames to Images", callback_data="convert_to_images")])
+    
+    keyboard.append([InlineKeyboardButton("🔄 Cancel", callback_data="cancel")])
+    
+    await update.message.reply_text(
+        f"📥 *File received!*\n\n"
+        f"📁 Name: {file_name}\n"
+        f"📊 Size: {file_obj.file_size / (1024 * 1024):.2f} MB\n"
+        f"🔢 Type: {file_type.upper()}\n\n"
+        f"What would you like to do?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle all button clicks."""
+    """Handle button presses"""
     query = update.callback_query
-    
-    # Always answer the callback query first
     await query.answer()
+    user_id = str(query.from_user.id)
     
-    logger.info(f"Button clicked: {query.data}")
-    
-    if query.data == "all_categories":
-        # Show all categories with stock summary
-        message = "📊 *All Categories Stock Summary:*\n\n"
-        for key, category in INVENTORY.items():
-            available = sum(1 for item in category["items"] if "✅" in item or "⚠️" in item)
-            total = len(category["items"])
-            message += f"• {category['name']}: {available}/{total} items available\n"
-        
-        # Add back button
-        keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
+    if query.data == "video_to_gif":
         await query.edit_message_text(
-            message, 
-            reply_markup=reply_markup,
+            "📤 *Send me a video file!*\n\n"
+            "Supported formats:\n"
+            "• MP4\n"
+            "• AVI\n"
+            "• MOV\n"
+            "• MKV\n"
+            "• WEBM\n\n"
+            "I'll convert it to a GIF for you! 🎬➡️🎞️",
             parse_mode="Markdown"
         )
         return
     
-    if query.data == "back_to_menu":
-        # Return to main menu
+    elif query.data == "gif_to_images":
+        await query.edit_message_text(
+            "📤 *Send me a GIF file!*\n\n"
+            "I'll extract all frames as images for you! 🎞️➡️🖼️\n\n"
+            "✨ *Tip:* For better quality, send large GIF files.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    elif query.data == "settings":
+        settings_text = (
+            "⚙️ *Settings*\n\n"
+            "You can customize:\n"
+            "• GIF quality (FPS)\n"
+            "• Output image format\n"
+            "• Frame extraction limit\n\n"
+            "🔜 This feature is coming soon!"
+        )
+        keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
+        await query.edit_message_text(
+            settings_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+    
+    elif query.data == "help":
+        help_text = (
+            "❓ *Help*\n\n"
+            "🎥 *Video to GIF:*\n"
+            "• Send a video file\n"
+            "• Select 'Convert to GIF'\n"
+            "• Receive your GIF\n\n"
+            "🎞️ *GIF to Images:*\n"
+            "• Send a GIF file\n"
+            "• Select 'Extract Frames'\n"
+            "• Receive all frames as images\n\n"
+            "⚠️ *Limitations:*\n"
+            "• Max file: 50MB\n"
+            "• Video: Max 60 seconds\n"
+            "• GIF frames: Max 50\n\n"
+            "💡 *Supported formats:*\n"
+            "• Videos: MP4, AVI, MOV, MKV, WEBM\n"
+            "• Images: PNG, JPEG\n"
+            "• GIF: Standard GIF format"
+        )
+        keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
+        await query.edit_message_text(
+            help_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+    
+    elif query.data == "back_to_menu":
         await start(update, context)
         return
     
-    # Handle category selection
-    category_info = INVENTORY.get(query.data)
+    elif query.data == "cancel":
+        if user_id in user_sessions:
+            del user_sessions[user_id]
+        await query.edit_message_text(
+            "✅ *Operation cancelled.*\n\n"
+            "Send /start to begin again.",
+            parse_mode="Markdown"
+        )
+        return
     
-    if category_info:
-        # Format the stock list with emojis
-        stock_list = "\n".join(category_info["items"])
+    elif query.data in ["convert_to_gif", "convert_to_images"]:
+        if user_id not in user_sessions:
+            await query.edit_message_text(
+                "❌ *Session expired!*\n\n"
+                "Please send the file again.",
+                parse_mode="Markdown"
+            )
+            return
         
-        message = (
-            f"📦 *{category_info['name']} - Live Stock:*\n"
-            f"{'─' * 30}\n"
-            f"{stock_list}\n"
-            f"{'─' * 30}\n\n"
-            "💡 *How to purchase:*\n"
-            "1️⃣ Click /purchase [gift card name]\n"
-            "2️⃣ Or contact @GiftmartSupport\n\n"
-            "🔄 *Need help?* Use /help"
-        )
+        file_info = user_sessions[user_id]
+        file_id = file_info["file_id"]
+        file_type = file_info["file_type"]
+        file_name = file_info["file_name"]
         
-        # Add back button
-        keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
+        # Inform user about processing
         await query.edit_message_text(
-            message, 
-            reply_markup=reply_markup,
+            "⏳ *Processing your file...*\n\n"
+            "This may take a few moments. Please wait! 🚀",
             parse_mode="Markdown"
         )
-    else:
-        await query.edit_message_text(
-            "❌ Category not found. Please use /start to return to main menu.",
-            parse_mode="Markdown"
-        )
+        
+        try:
+            # Download file
+            file = await context.bot.get_file(file_id)
+            
+            # Create temp files
+            input_path = TEMP_DIR / f"{user_id}_input.{file_name.split('.')[-1] if '.' in file_name else 'file'}"
+            output_dir = TEMP_DIR / f"{user_id}_output"
+            output_dir.mkdir(exist_ok=True)
+            
+            # Download file
+            await file.download_to_drive(input_path)
+            
+            if query.data == "convert_to_gif":
+                # Video to GIF
+                output_path = TEMP_DIR / f"{user_id}_output.gif"
+                
+                # Determine if we need to extract frames
+                if file_type == "video":
+                    # Video to GIF
+                    result, error = video_to_gif(str(input_path), str(output_path), fps=10)
+                    if error:
+                        await query.edit_message_text(
+                            f"❌ *Conversion failed!*\n\n"
+                            f"Error: {error[:200]}\n\n"
+                            f"Please try again or contact support.",
+                            parse_mode="Markdown"
+                        )
+                        cleanup_temp_files(str(input_path))
+                        return
+                    
+                    # Send the GIF
+                    with open(output_path, 'rb') as f:
+                        await context.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=f,
+                            filename=f"{file_name.split('.')[0]}.gif",
+                            caption="🎉 *Here's your GIF!* 🎉\n\nConverted from video successfully!",
+                            parse_mode="Markdown"
+                        )
+                
+                # Cleanup
+                cleanup_temp_files(str(input_path))
+                cleanup_temp_files(str(output_path))
+                shutil.rmtree(str(output_dir), ignore_errors=True)
+                del user_sessions[user_id]
+                
+                # Send success message
+                await query.edit_message_text(
+                    "✅ *Conversion complete!*\n\n"
+                    "🎬 Video → GIF ✅\n"
+                    "📤 GIF sent successfully!\n\n"
+                    "🔄 Send another file or type /start to begin again.",
+                    parse_mode="Markdown"
+                )
+                
+            elif query.data == "convert_to_images":
+                # GIF to Images
+                frames, error = gif_to_frames(str(input_path), str(output_dir), "png")
+                if error:
+                    await query.edit_message_text(
+                        f"❌ *Extraction failed!*\n\n"
+                        f"Error: {error[:200]}\n\n"
+                        f"Please try again or contact support.",
+                        parse_mode="Markdown"
+                    )
+                    cleanup_temp_files(str(input_path))
+                    return
+                
+                # Send frames as a photo album
+                media_group = []
+                for i, frame_path in enumerate(frames[:20]):  # Limit to 20 frames
+                    with open(frame_path, 'rb') as f:
+                        caption = f"Frame {i+1}/{len(frames)}" if i == 0 else None
+                        await context.bot.send_photo(
+                            chat_id=update.effective_chat.id,
+                            photo=f,
+                            caption=caption if i == 0 else None
+                        )
+                
+                # If more than 20 frames, send as zip
+                if len(frames) > 20:
+                    import zipfile
+                    zip_path = TEMP_DIR / f"{user_id}_frames.zip"
+                    with zipfile.ZipFile(zip_path, 'w') as zipf:
+                        for frame_path in frames:
+                            zipf.write(frame_path, os.path.basename(frame_path))
+                    
+                    with open(zip_path, 'rb') as f:
+                        await context.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=f,
+                            filename=f"{file_name.split('.')[0]}_frames.zip",
+                            caption=f"📦 *All {len(frames)} frames* in a zip file!",
+                            parse_mode="Markdown"
+                        )
+                    
+                    cleanup_temp_files(str(zip_path))
+                
+                # Cleanup
+                cleanup_temp_files(str(input_path))
+                shutil.rmtree(str(output_dir), ignore_errors=True)
+                for frame in frames:
+                    cleanup_temp_files(frame)
+                del user_sessions[user_id]
+                
+                await query.edit_message_text(
+                    "✅ *Extraction complete!*\n\n"
+                    "🎞️ GIF → Images ✅\n"
+                    f"📤 {len(frames)} frames sent successfully!\n\n"
+                    "🔄 Send another file or type /start to begin again.",
+                    parse_mode="Markdown"
+                )
+                
+        except Exception as e:
+            logger.error(f"Conversion error: {e}")
+            await query.edit_message_text(
+                f"❌ *An error occurred!*\n\n"
+                f"Error: {str(e)[:200]}\n\n"
+                f"Please try again with a different file.",
+                parse_mode="Markdown"
+            )
+            if user_id in user_sessions:
+                del user_sessions[user_id]
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send help message."""
+    """Send help message"""
     help_text = (
-        "🤖 *Giftmart Bot Help*\n\n"
-        "📋 *Available Commands:*\n"
-        "• /start - Open main catalog with menu buttons\n"
-        "• /help - Show this help message\n"
-        "• /stock - Check all categories stock summary\n"
-        "• /purchase [item] - Purchase a gift card (coming soon)\n\n"
-        "📱 *How to use:*\n"
-        "1. Click /start to open the menu\n"
-        "2. Select a category to view available gift cards\n"
-        "3. Check stock status and pricing\n"
-        "4. Contact support to purchase\n\n"
-        "❓ For support: @GiftmartSupport"
+        "🎬 *Media Converter Bot Help*\n\n"
+        "📋 *Commands:*\n"
+        "• /start - Start the bot\n"
+        "• /help - Show this help\n\n"
+        "🎥 *Video → GIF:*\n"
+        "1. Send a video file\n"
+        "2. Click 'Convert to GIF'\n"
+        "3. Receive your GIF\n\n"
+        "🎞️ *GIF → Images:*\n"
+        "1. Send a GIF file\n"
+        "2. Click 'Extract Frames'\n"
+        "3. Receive images\n\n"
+        "⚡ *Tips:*\n"
+        "• Smaller files process faster\n"
+        "• GIF quality depends on video quality\n"
+        "• PNG frames preserve best quality\n\n"
+        "💬 *Support:* @YourSupportHandle"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
-async def stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show all categories with stock status."""
-    message = "📊 *All Categories Stock Status:*\n\n"
-    
-    for key, category in INVENTORY.items():
-        available = sum(1 for item in category["items"] if "✅" in item)
-        low_stock = sum(1 for item in category["items"] if "⚠️" in item)
-        out_of_stock = sum(1 for item in category["items"] if "❌" in item)
-        
-        message += f"*{category['name']}*\n"
-        message += f"✅ Available: {available} | ⚠️ Low: {low_stock} | ❌ Out: {out_of_stock}\n\n"
-    
-    message += "🔄 Type /start to browse categories with interactive buttons."
-    
-    await update.message.reply_text(message, parse_mode="Markdown")
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel current operation"""
+    user_id = str(update.effective_user.id)
+    if user_id in user_sessions:
+        del user_sessions[user_id]
+    await update.message.reply_text(
+        "✅ *Operation cancelled.*\n\n"
+        "Send /start to begin again.",
+        parse_mode="Markdown"
+    )
 
-async def purchase_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle purchase requests."""
-    if context.args:
-        item_name = " ".join(context.args)
-        message = (
-            f"🛒 *Purchase Request*\n\n"
-            f"Item: *{item_name}*\n"
-            f"Status: ⏳ Processing...\n\n"
-            f"📞 Please contact @GiftmartSupport to complete your purchase.\n"
-            f"💳 Payment methods: Bitcoin, PayPal, Credit Card"
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}")
+    if update and update.effective_message:
+        await update.effective_message.reply_text(
+            "❌ *An error occurred!*\n\n"
+            "Please try again or contact support.\n"
+            "If this persists, try using /start to begin a new session.",
+            parse_mode="Markdown"
         )
-    else:
-        message = (
-            "🛒 *How to Purchase*\n\n"
-            "To purchase a gift card, use:\n"
-            "`/purchase [gift card name]`\n\n"
-            "Example: `/purchase PlayStation Store $10`\n\n"
-            "Or contact @GiftmartSupport directly."
-        )
-    
-    await update.message.reply_text(message, parse_mode="Markdown")
-
-async def start_with_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle start command when editing messages."""
-    query = update.callback_query
-    await query.answer()
-    await start(update, context)
 
 def main() -> None:
-    """Start the bot."""
-    # Get token from environment
+    """Start the bot"""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("❌ No TELEGRAM_BOT_TOKEN found in environment variables!")
         return
     
-    logger.info("🚀 Starting Giftmart bot...")
+    logger.info("🚀 Starting Media Converter Bot...")
     
     # Create application
     application = Application.builder().token(token).build()
@@ -216,14 +498,22 @@ def main() -> None:
     # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("stock", stock_command))
-    application.add_handler(CommandHandler("purchase", purchase_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     
-    # Add callback query handler for buttons
+    # Add file handler
+    application.add_handler(MessageHandler(
+        filters.Document.VIDEO | filters.Document.ANIMATION | filters.VIDEO | filters.ANIMATION,
+        handle_file
+    ))
+    
+    # Add button callback handler
     application.add_handler(CallbackQueryHandler(button_callback))
     
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
     # Start polling
-    logger.info("✅ Bot is running and listening for messages...")
+    logger.info("✅ Bot is running...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
