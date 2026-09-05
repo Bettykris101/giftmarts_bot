@@ -1,6 +1,6 @@
 python-telegram-bot==20.8
-opencv-python==4.10.0.84
 pillow==10.4.0
 imageio==2.34.1
 imageio-ffmpeg==0.5.1
 numpy==1.26.4
+moviepy==1.0.3
