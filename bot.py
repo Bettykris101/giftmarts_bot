@@ -1,15 +1,10 @@
 import os
+import json
 import logging
-import tempfile
-import shutil
-from pathlib import Path
+import asyncio
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-from PIL import Image
-import imageio
-import numpy as np
-from moviepy.editor import VideoFileClip
-import zipfile
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, JobQueue
 
 # Enable logging
 logging.basicConfig(
@@ -18,464 +13,462 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Ensure temp directory exists
-TEMP_DIR = Path("temp_files")
-TEMP_DIR.mkdir(exist_ok=True)
+# Data file paths
+USERS_FILE = "users.json"
 
-# User session storage (simple in-memory)
-user_sessions = {}
-
-# Helper Functions
-def cleanup_temp_files(file_path):
-    """Remove temporary files"""
+# Data management functions
+def load_data(file_path):
     try:
-        if os.path.exists(file_path):
-            if os.path.isdir(file_path):
-                shutil.rmtree(file_path, ignore_errors=True)
-            else:
-                os.remove(file_path)
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
-def video_to_gif(video_path, output_path, fps=10, max_frames=100):
-    """Convert video to GIF using moviepy and imageio"""
-    try:
-        # Load video
-        clip = VideoFileClip(video_path)
-        
-        # Reduce duration if too long (max 60 seconds)
-        if clip.duration > 60:
-            clip = clip.subclip(0, 60)
-        
-        # Resize if too large (max 480p)
-        if clip.size[0] > 480 or clip.size[1] > 480:
-            clip = clip.resize(height=480)
-        
-        # Extract frames
-        frames = []
-        frame_count = min(int(clip.duration * fps), max_frames)
-        
-        for t in range(frame_count):
-            frame = clip.get_frame(t / fps)
-            frames.append(frame)
-        
-        clip.close()
-        
-        if not frames:
-            return None, "No frames extracted from video"
-        
-        # Convert to uint8
-        frames = [np.array(frame, dtype=np.uint8) for frame in frames]
-        
-        # Save as GIF
-        imageio.mimsave(output_path, frames, fps=fps)
-        
-        return output_path, None
-    except Exception as e:
-        logger.error(f"Video to GIF error: {e}")
-        return None, str(e)
+def save_data(file_path, data):
+    with open(file_path, 'w') as f:
+        json.dump(data, f, indent=2)
 
-def gif_to_frames(gif_path, output_dir, format="png", max_frames=50):
-    """Extract frames from GIF to images"""
+def load_users():
+    return load_data(USERS_FILE)
+
+def save_users(users):
+    save_data(USERS_FILE, users)
+
+# Main catalog message
+CATALOG_MESSAGE = """🏨 *BOOK CHEAP HOTELS ONLINE. NO RESERVATION COSTS. GREAT RATES. SAVE 50% WITH GENIUS.* 🏨
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✈️ *AIRLINES / FLIGHTS*
+• Delta Gift Cards
+• American Airlines Gift Cards
+• Norwegian Airlines Gift Cards
+• British Airways Gift Cards
+• Alaska Airlines Gift Cards
+• Hawaiian Airlines Gift Cards
+• Virgin Atlantic Gift Cards
+• Pegasus Airlines Gift Cards
+*+300 More…*
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🏠 *AIRBNB & HOTELS*
+• Airbnb Gift Cards
+• Roomcard Gift Cards
+• Hotels.com Gift Cards
+• Hotelgift Gift Cards
+• Hilton Hotels Gift Cards
+• Choice Hotels Gift Cards
+• Mr. and Mrs. Smith Gift Cards
+• Four Seasons Hotels Gift Cards
+• Kimpton Hotels & Restaurants Gift Cards
+*+100 More…*
+
+📚 *202 Methods*
+• 2026 Methods and Tutorials
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🛍️ *SHOPPING STORES*
+• Nikes Gift Cards
+• Adidas Gift Cards
+• Cotton.on Gift Cards
+• BestBuy Gift Cards
+• Walmart Gift Cards
+*And Many More…*
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💳 *MORE GIFT CARDS*
+• Visa Gift Card
+• Amazon Gift Card
+• American Express Gift Card
+• iTunes Gift Card
+• Walmart Gift Card
+• Target Gift Card
+• Starbucks Gift Card
+• Netflix Gift Card
+• eBay Gift Card
+• Google Play Gift Card
+• MasterCard Gift Card
+• Disney Gift Card
+• Macy's Gift Card
+• Best Buy Gift Card
+• Sephora Gift Card
+• Home Depot Gift Card
+• McDonald's Gift Card
+• Costco Gift Card
+• Chipotle Gift Card
+• Etsy Gift Card
+• Lowe's Gift Card
+• Ikea Gift Card
+• Gamestop Gift Card
+• Nordstrom Gift Card
+• Whole Foods Gift Card
+• Apple Store Gift Card
+• H&M Gift Card
+• Subway Gift Card
+• Nike Gift Card
+• Olive Garden Gift Card
+• Rei Gift Card
+• Shell Gift Card
+• T.J. Maxx Gift Card
+• Red Lobster Gift Card
+• Victoria's Secret Gift Card
+• Old Navy Gift Card
+• Pizza Hut Gift Card
+• Sears Gift Card
+• Cotton.on Gift Card
+• Uber Gift Card
+• Apple Gift Cards
+• Tickets Master Gift Cards
+• T-Mobile Gift Card and Refill
+• Cricket Gift Cards
+• Verizon Gift Card
+*And Others…*
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📅 *BOOKINGS*
+• AirBnB & Hotels
+• Airlines
+• Car Rentals
+
+💰 *RATE*
+🌐 50% Off Discount
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🛒 *How to Order:*
+Click the button below to browse categories or contact support!"""
+
+# Channel link message
+CHANNEL_MESSAGE = """📢 *JOIN OUR OFFICIAL CHANNEL*
+
+Get exclusive deals, updates, and gift card drops before anyone else!
+
+👇 Click below to join:
+
+https://t.me/+LsdZ3yOo8XFjMzhk
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🛒 *Browse our catalog:* /start
+❓ *Need help?* /help"""
+
+# Contact admin message
+CONTACT_MESSAGE = """👤 *CONTACT ADMIN*
+
+Have questions or want to place an order?
+
+📩 *Message Admin:* @Rt3458uy
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💬 Our team responds within minutes!
+
+🛒 *Browse catalog:* /start
+📢 *Join channel:* [Click Here](https://t.me/+LsdZ3yOo8XFjMzhk)"""
+
+# Main menu keyboard
+def get_main_menu_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("✈️ Airlines / Flights", callback_data="category_airlines")],
+        [InlineKeyboardButton("🏠 Airbnb & Hotels", callback_data="category_hotels")],
+        [InlineKeyboardButton("🛍️ Shopping Stores", callback_data="category_shopping")],
+        [InlineKeyboardButton("💳 All Gift Cards", callback_data="category_giftcards")],
+        [InlineKeyboardButton("📚 202 Methods", callback_data="category_methods")],
+        [InlineKeyboardButton("💰 50% Off Deals", callback_data="category_deals")],
+        [InlineKeyboardButton("📢 Join Channel", url="https://t.me/+LsdZ3yOo8XFjMzhk")],
+        [InlineKeyboardButton("👤 Contact Admin", url="https://t.me/Rt3458uy")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# Category details
+CATEGORIES = {
+    "airlines": {
+        "name": "✈️ Airlines / Flights",
+        "items": [
+            "Delta Gift Cards",
+            "American Airlines Gift Cards",
+            "Norwegian Airlines Gift Cards",
+            "British Airways Gift Cards",
+            "Alaska Airlines Gift Cards",
+            "Hawaiian Airlines Gift Cards",
+            "Virgin Atlantic Gift Cards",
+            "Pegasus Airlines Gift Cards",
+            "+300 More…"
+        ]
+    },
+    "hotels": {
+        "name": "🏠 Airbnb & Hotels",
+        "items": [
+            "Airbnb Gift Cards",
+            "Roomcard Gift Cards",
+            "Hotels.com Gift Cards",
+            "Hotelgift Gift Cards",
+            "Hilton Hotels Gift Cards",
+            "Choice Hotels Gift Cards",
+            "Mr. and Mrs. Smith Gift Cards",
+            "Four Seasons Hotels Gift Cards",
+            "Kimpton Hotels & Restaurants Gift Cards",
+            "+100 More…"
+        ]
+    },
+    "shopping": {
+        "name": "🛍️ Shopping Stores",
+        "items": [
+            "Nikes Gift Cards",
+            "Adidas Gift Cards",
+            "Cotton.on Gift Cards",
+            "BestBuy Gift Cards",
+            "Walmart Gift Cards",
+            "And Many More…"
+        ]
+    },
+    "giftcards": {
+        "name": "💳 All Gift Cards",
+        "items": [
+            "Visa Gift Card", "Amazon Gift Card", "American Express Gift Card",
+            "iTunes Gift Card", "Walmart Gift Card", "Target Gift Card",
+            "Starbucks Gift Card", "Netflix Gift Card", "eBay Gift Card",
+            "Google Play Gift Card", "MasterCard Gift Card", "Disney Gift Card",
+            "Macy's Gift Card", "Best Buy Gift Card", "Sephora Gift Card",
+            "Home Depot Gift Card", "McDonald's Gift Card", "Costco Gift Card",
+            "Chipotle Gift Card", "Etsy Gift Card", "Lowe's Gift Card",
+            "Ikea Gift Card", "Gamestop Gift Card", "Nordstrom Gift Card",
+            "Whole Foods Gift Card", "Apple Store Gift Card", "H&M Gift Card",
+            "Subway Gift Card", "Nike Gift Card", "Olive Garden Gift Card",
+            "Rei Gift Card", "Shell Gift Card", "T.J. Maxx Gift Card",
+            "Red Lobster Gift Card", "Victoria's Secret Gift Card",
+            "Old Navy Gift Card", "Pizza Hut Gift Card", "Sears Gift Card",
+            "Cotton.on Gift Card", "Uber Gift Card", "Apple Gift Cards",
+            "Tickets Master Gift Cards", "T-Mobile Gift Card and Refill",
+            "Cricket Gift Cards", "Verizon Gift Card", "And Others…"
+        ]
+    },
+    "methods": {
+        "name": "📚 202 Methods",
+        "items": [
+            "2026 Methods and Tutorials",
+            "Premium Methods Available",
+            "Contact admin for full list"
+        ]
+    },
+    "deals": {
+        "name": "💰 50% Off Deals",
+        "items": [
+            "🌐 50% Off Discount on all gift cards",
+            "No reservation costs",
+            "Great rates guaranteed",
+            "Save 50% with Genius"
+        ]
+    }
+}
+
+# Send initial messages function
+async def send_initial_messages(chat_id, context):
+    """Send the initial 3 messages with 2-minute delays"""
     try:
-        gif = Image.open(gif_path)
-        frames = []
+        # Message 1: Main catalog (already sent in /start)
         
-        # Limit to max_frames
-        total_frames = min(gif.n_frames, max_frames)
+        # Wait 2 minutes, then send channel link
+        await asyncio.sleep(120)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=CHANNEL_MESSAGE,
+            parse_mode="Markdown",
+            disable_web_page_preview=False
+        )
         
-        for frame_idx in range(total_frames):
-            gif.seek(frame_idx)
-            frame = gif.copy()
-            
-            # Convert to RGB if needed
-            if frame.mode != 'RGB':
-                frame = frame.convert('RGB')
-            
-            frame_path = os.path.join(output_dir, f"frame_{frame_idx+1:03d}.{format}")
-            frame.save(frame_path, format.upper())
-            frames.append(frame_path)
+        # Wait 2 more minutes, then send contact info
+        await asyncio.sleep(120)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=CONTACT_MESSAGE,
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
         
-        gif.close()
-        return frames, None
     except Exception as e:
-        logger.error(f"GIF to frames error: {e}")
-        return None, str(e)
+        logger.error(f"Error sending initial messages: {e}")
+
+# Hourly reminder function
+async def send_hourly_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Send hourly reminder to all users"""
+    try:
+        users = load_users()
+        
+        if not users:
+            logger.info("No users to remind")
+            return
+        
+        for user_id, user_data in users.items():
+            try:
+                # Send the main catalog message
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=CATALOG_MESSAGE,
+                    parse_mode="Markdown",
+                    reply_markup=get_main_menu_keyboard()
+                )
+                
+                # Update last reminder time
+                user_data['last_reminder'] = datetime.now().isoformat()
+                
+            except Exception as e:
+                logger.error(f"Error sending reminder to {user_id}: {e}")
+        
+        save_users(users)
+        logger.info(f"Hourly reminders sent to {len(users)} users")
+        
+    except Exception as e:
+        logger.error(f"Error in hourly reminder: {e}")
 
 # Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send welcome message"""
+    """Send welcome message and catalog"""
     user = update.effective_user
+    user_id = str(user.id)
     
-    welcome_text = (
-        f"🎬 *Hi {user.first_name}! Welcome to Media Converter Bot!*\n\n"
-        f"I can convert:\n"
-        f"🎥 Video → GIF\n"
-        f"🎞️ GIF → Images\n\n"
-        f"*How to use:*\n"
-        f"1. Send me a video or GIF file\n"
-        f"2. Choose your conversion option\n"
-        f"3. Wait for the magic! ✨\n\n"
-        f"⚠️ *Limits:*\n"
-        f"• Max file size: 50MB\n"
-        f"• Video length: Max 60 seconds\n"
-        f"• GIF frames: Max 50\n\n"
-        f"🔄 *Commands:*\n"
-        f"/start - Show this menu\n"
-        f"/help - More details\n"
-        f"/cancel - Cancel current operation"
+    # Register user
+    users = load_users()
+    if user_id not in users:
+        users[user_id] = {
+            "username": user.first_name or "User",
+            "first_seen": datetime.now().isoformat(),
+            "last_reminder": None,
+            "messages_received": 0
+        }
+    users[user_id]["messages_received"] = users[user_id].get("messages_received", 0) + 1
+    save_users(users)
+    
+    # Send main catalog message with buttons
+    await update.message.reply_text(
+        CATALOG_MESSAGE,
+        parse_mode="Markdown",
+        reply_markup=get_main_menu_keyboard()
     )
     
+    # Start the delayed messages sequence
+    context.application.create_task(
+        send_initial_messages(update.effective_chat.id, context)
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send help message"""
+    help_text = (
+        "🆘 *Giftmart Help*\n\n"
+        "📋 *Commands:*\n"
+        "• /start - View catalog\n"
+        "• /help - This menu\n"
+        "• /categories - Browse categories\n"
+        "• /contact - Contact admin\n"
+        "• /channel - Join our channel\n\n"
+        "🛒 *How to Order:*\n"
+        "1. Browse our catalog\n"
+        "2. Choose your gift card\n"
+        "3. Contact @Rt3458uy to order\n\n"
+        "💰 *Discounts:*\n"
+        "🌐 50% Off on all gift cards\n\n"
+        "📢 *Join Channel:*\n"
+        "https://t.me/+LsdZ3yOo8XFjMzhk\n\n"
+        "👤 *Contact Admin:*\n"
+        "@Rt3458uy"
+    )
+    await update.message.reply_text(
+        help_text,
+        parse_mode="Markdown",
+        reply_markup=get_main_menu_keyboard()
+    )
+
+async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show all categories"""
     keyboard = [
-        [InlineKeyboardButton("🎥 Convert Video to GIF", callback_data="video_to_gif")],
-        [InlineKeyboardButton("🎞️ Convert GIF to Images", callback_data="gif_to_images")],
-        [InlineKeyboardButton("❓ Help", callback_data="help")]
+        [InlineKeyboardButton("✈️ Airlines / Flights", callback_data="category_airlines")],
+        [InlineKeyboardButton("🏠 Airbnb & Hotels", callback_data="category_hotels")],
+        [InlineKeyboardButton("🛍️ Shopping Stores", callback_data="category_shopping")],
+        [InlineKeyboardButton("💳 All Gift Cards", callback_data="category_giftcards")],
+        [InlineKeyboardButton("📚 202 Methods", callback_data="category_methods")],
+        [InlineKeyboardButton("💰 50% Off Deals", callback_data="category_deals")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        welcome_text,
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
+        "📂 *Browse Categories*\n\nSelect a category to view available gift cards:",
+        parse_mode="Markdown",
+        reply_markup=reply_markup
     )
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming video or GIF files"""
-    user = update.effective_user
-    user_id = str(user.id)
-    
-    # Check if it's a video or GIF
-    document = update.message.document
-    video = update.message.video
-    animation = update.message.animation
-    
-    file_obj = None
-    file_type = None
-    file_name = None
-    mime_type = None
-    
-    if document:
-        file_name = document.file_name or "file"
-        mime_type = document.mime_type or ""
-        if file_name.lower().endswith(('.gif', '.mp4', '.avi', '.mov', '.mkv', '.webm')) or 'video' in mime_type:
-            file_obj = document
-            file_type = "document"
-    elif video:
-        file_obj = video
-        file_type = "video"
-        file_name = f"{user_id}_video.mp4"
-    elif animation:
-        file_obj = animation
-        file_type = "gif"
-        file_name = f"{user_id}_animation.gif"
-    else:
-        await update.message.reply_text(
-            "❌ Please send a video file (MP4, AVI, MOV, MKV, WEBM) or GIF.\n\n"
-            "I support most video formats and animated GIFs!"
-        )
-        return
-    
-    # Check file size (50MB limit)
-    if file_obj.file_size > 50 * 1024 * 1024:
-        await update.message.reply_text(
-            "❌ File is too large! Maximum size is 50MB.\n"
-            "Please compress your file and try again."
-        )
-        return
-    
-    # Store file info in user session
-    user_sessions[user_id] = {
-        "file_id": file_obj.file_id,
-        "file_type": file_type,
-        "file_name": file_name,
-        "file_size": file_obj.file_size
-    }
-    
-    # Show conversion options
-    keyboard = []
-    if file_type in ["video", "document"]:
-        keyboard.append([InlineKeyboardButton("🎥 Convert to GIF", callback_data="convert_to_gif")])
-    elif file_type == "gif":
-        keyboard.append([InlineKeyboardButton("🎞️ Extract Frames to Images", callback_data="convert_to_images")])
-    
-    keyboard.append([InlineKeyboardButton("🔄 Cancel", callback_data="cancel")])
-    
+async def contact_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send contact information"""
     await update.message.reply_text(
-        f"📥 *File received!*\n\n"
-        f"📁 Name: {file_name}\n"
-        f"📊 Size: {file_obj.file_size / (1024 * 1024):.2f} MB\n"
-        f"🔢 Type: {file_type.upper()}\n\n"
-        f"What would you like to do?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
+        CONTACT_MESSAGE,
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
+
+async def channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send channel link"""
+    await update.message.reply_text(
+        CHANNEL_MESSAGE,
+        parse_mode="Markdown",
+        disable_web_page_preview=False
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle button presses"""
     query = update.callback_query
     await query.answer()
-    user_id = str(query.from_user.id)
     
-    if query.data == "video_to_gif":
+    if query.data == "back_to_menu":
         await query.edit_message_text(
-            "📤 *Send me a video file!*\n\n"
-            "Supported formats:\n"
-            "• MP4\n"
-            "• AVI\n"
-            "• MOV\n"
-            "• MKV\n"
-            "• WEBM\n\n"
-            "I'll convert it to a GIF for you! 🎬➡️🎞️",
-            parse_mode="Markdown"
+            CATALOG_MESSAGE,
+            parse_mode="Markdown",
+            reply_markup=get_main_menu_keyboard()
         )
         return
     
-    elif query.data == "gif_to_images":
-        await query.edit_message_text(
-            "📤 *Send me a GIF file!*\n\n"
-            "I'll extract all frames as images for you! 🎞️➡️🖼️\n\n"
-            "✨ *Tip:* For better quality, send large GIF files.",
-            parse_mode="Markdown"
-        )
-        return
-    
-    elif query.data == "help":
-        help_text = (
-            "❓ *Help*\n\n"
-            "🎥 *Video to GIF:*\n"
-            "• Send a video file\n"
-            "• Select 'Convert to GIF'\n"
-            "• Receive your GIF\n\n"
-            "🎞️ *GIF to Images:*\n"
-            "• Send a GIF file\n"
-            "• Select 'Extract Frames'\n"
-            "• Receive all frames as images\n\n"
-            "⚠️ *Limitations:*\n"
-            "• Max file: 50MB\n"
-            "• Video: Max 60 seconds\n"
-            "• GIF frames: Max 50\n\n"
-            "💡 *Supported formats:*\n"
-            "• Videos: MP4, AVI, MOV, MKV, WEBM\n"
-            "• Images: PNG, JPEG\n"
-            "• GIF: Standard GIF format"
-        )
-        keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
-        await query.edit_message_text(
-            help_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-        return
-    
-    elif query.data == "back_to_menu":
-        await start(update, context)
-        return
-    
-    elif query.data == "cancel":
-        if user_id in user_sessions:
-            del user_sessions[user_id]
-        await query.edit_message_text(
-            "✅ *Operation cancelled.*\n\n"
-            "Send /start to begin again.",
-            parse_mode="Markdown"
-        )
-        return
-    
-    elif query.data in ["convert_to_gif", "convert_to_images"]:
-        if user_id not in user_sessions:
+    if query.data.startswith("category_"):
+        category_key = query.data.replace("category_", "")
+        category = CATEGORIES.get(category_key)
+        
+        if not category:
             await query.edit_message_text(
-                "❌ *Session expired!*\n\n"
-                "Please send the file again.",
+                "❌ Category not found!",
                 parse_mode="Markdown"
             )
             return
         
-        file_info = user_sessions[user_id]
-        file_id = file_info["file_id"]
-        file_type = file_info["file_type"]
-        file_name = file_info["file_name"]
+        # Format category items
+        items_text = "\n".join([f"• {item}" for item in category["items"]])
         
-        # Inform user about processing
-        await query.edit_message_text(
-            "⏳ *Processing your file...*\n\n"
-            "This may take a few moments. Please wait! 🚀",
-            parse_mode="Markdown"
+        message = (
+            f"*{category['name']}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{items_text}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💰 *50% Off on all items!*\n\n"
+            f"🛒 *To order:* Contact @Rt3458uy"
         )
         
-        try:
-            # Download file
-            file = await context.bot.get_file(file_id)
-            
-            # Create temp files
-            input_path = TEMP_DIR / f"{user_id}_input"
-            output_dir = TEMP_DIR / f"{user_id}_output"
-            output_dir.mkdir(exist_ok=True)
-            
-            # Download file with proper extension
-            ext = file_name.split('.')[-1] if '.' in file_name else 'file'
-            input_file = TEMP_DIR / f"{user_id}_input.{ext}"
-            await file.download_to_drive(input_file)
-            
-            if query.data == "convert_to_gif":
-                # Video to GIF
-                output_path = TEMP_DIR / f"{user_id}_output.gif"
-                
-                result, error = video_to_gif(str(input_file), str(output_path))
-                if error:
-                    await query.edit_message_text(
-                        f"❌ *Conversion failed!*\n\n"
-                        f"Error: {error[:200]}\n\n"
-                        f"Please try again or contact support.",
-                        parse_mode="Markdown"
-                    )
-                    cleanup_temp_files(str(input_file))
-                    return
-                
-                # Send the GIF
-                with open(output_path, 'rb') as f:
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=f,
-                        filename=f"{os.path.splitext(file_name)[0]}.gif",
-                        caption="🎉 *Here's your GIF!* 🎉\n\nConverted from video successfully!",
-                        parse_mode="Markdown"
-                    )
-                
-                # Cleanup
-                cleanup_temp_files(str(input_file))
-                cleanup_temp_files(str(output_path))
-                shutil.rmtree(str(output_dir), ignore_errors=True)
-                if user_id in user_sessions:
-                    del user_sessions[user_id]
-                
-                await query.edit_message_text(
-                    "✅ *Conversion complete!*\n\n"
-                    "🎬 Video → GIF ✅\n"
-                    "📤 GIF sent successfully!\n\n"
-                    "🔄 Send another file or type /start to begin again.",
-                    parse_mode="Markdown"
-                )
-                
-            elif query.data == "convert_to_images":
-                # GIF to Images
-                frames, error = gif_to_frames(str(input_file), str(output_dir), "png")
-                if error:
-                    await query.edit_message_text(
-                        f"❌ *Extraction failed!*\n\n"
-                        f"Error: {error[:200]}\n\n"
-                        f"Please try again or contact support.",
-                        parse_mode="Markdown"
-                    )
-                    cleanup_temp_files(str(input_file))
-                    return
-                
-                if not frames:
-                    await query.edit_message_text(
-                        "❌ *No frames extracted!*\n\n"
-                        "The GIF might be empty or corrupted.",
-                        parse_mode="Markdown"
-                    )
-                    cleanup_temp_files(str(input_file))
-                    return
-                
-                # Send frames as images (limit to 10 to avoid spam)
-                for i, frame_path in enumerate(frames[:10]):
-                    with open(frame_path, 'rb') as f:
-                        caption = f"Frame {i+1}/{len(frames)}" if i == 0 else None
-                        await context.bot.send_photo(
-                            chat_id=update.effective_chat.id,
-                            photo=f,
-                            caption=caption if i == 0 else None
-                        )
-                
-                # If more than 10 frames, send as zip
-                if len(frames) > 10:
-                    zip_path = TEMP_DIR / f"{user_id}_frames.zip"
-                    with zipfile.ZipFile(zip_path, 'w') as zipf:
-                        for frame_path in frames:
-                            zipf.write(frame_path, os.path.basename(frame_path))
-                    
-                    with open(zip_path, 'rb') as f:
-                        await context.bot.send_document(
-                            chat_id=update.effective_chat.id,
-                            document=f,
-                            filename=f"{os.path.splitext(file_name)[0]}_frames.zip",
-                            caption=f"📦 *All {len(frames)} frames* in a zip file!",
-                            parse_mode="Markdown"
-                        )
-                    
-                    cleanup_temp_files(str(zip_path))
-                
-                # Cleanup
-                cleanup_temp_files(str(input_file))
-                shutil.rmtree(str(output_dir), ignore_errors=True)
-                if user_id in user_sessions:
-                    del user_sessions[user_id]
-                
-                await query.edit_message_text(
-                    "✅ *Extraction complete!*\n\n"
-                    "🎞️ GIF → Images ✅\n"
-                    f"📤 {len(frames)} frames sent successfully!\n\n"
-                    "🔄 Send another file or type /start to begin again.",
-                    parse_mode="Markdown"
-                )
-                
-        except Exception as e:
-            logger.error(f"Conversion error: {e}")
-            await query.edit_message_text(
-                f"❌ *An error occurred!*\n\n"
-                f"Error: {str(e)[:200]}\n\n"
-                f"Please try again with a different file.",
-                parse_mode="Markdown"
-            )
-            if user_id in user_sessions:
-                del user_sessions[user_id]
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send help message"""
-    help_text = (
-        "🎬 *Media Converter Bot Help*\n\n"
-        "📋 *Commands:*\n"
-        "• /start - Start the bot\n"
-        "• /help - Show this help\n"
-        "• /cancel - Cancel current operation\n\n"
-        "🎥 *Video → GIF:*\n"
-        "1. Send a video file\n"
-        "2. Click 'Convert to GIF'\n"
-        "3. Receive your GIF\n\n"
-        "🎞️ *GIF → Images:*\n"
-        "1. Send a GIF file\n"
-        "2. Click 'Extract Frames'\n"
-        "3. Receive images\n\n"
-        "⚡ *Tips:*\n"
-        "• Smaller files process faster\n"
-        "• GIF quality depends on video quality\n"
-        "• PNG frames preserve best quality\n\n"
-        "💬 *Support:* @YourSupportHandle"
-    )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cancel current operation"""
-    user_id = str(update.effective_user.id)
-    if user_id in user_sessions:
-        del user_sessions[user_id]
-    await update.message.reply_text(
-        "✅ *Operation cancelled.*\n\n"
-        "Send /start to begin again.",
-        parse_mode="Markdown"
-    )
+        keyboard = [
+            [InlineKeyboardButton("👤 Contact Admin", url="https://t.me/Rt3458uy")],
+            [InlineKeyboardButton("📢 Join Channel", url="https://t.me/+LsdZ3yOo8XFjMzhk")],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            message,
+            parse_mode="Markdown",
+            reply_markup=reply_markup
+        )
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle errors"""
     logger.error(f"Update {update} caused error {context.error}")
-    if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "❌ *An error occurred!*\n\n"
-            "Please try again or contact support.\n"
-            "If this persists, try using /start to begin a new session.",
-            parse_mode="Markdown"
-        )
 
 def main() -> None:
     """Start the bot"""
@@ -484,21 +477,17 @@ def main() -> None:
         logger.error("❌ No TELEGRAM_BOT_TOKEN found in environment variables!")
         return
     
-    logger.info("🚀 Starting Media Converter Bot...")
+    logger.info("🚀 Starting Giftmart bot...")
     
-    # Create application
+    # Create application with JobQueue for hourly reminders
     application = Application.builder().token(token).build()
     
     # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
-    
-    # Add file handler with correct filters
-    application.add_handler(MessageHandler(
-        filters.VIDEO | filters.ANIMATION | filters.Document.VIDEO,
-        handle_file
-    ))
+    application.add_handler(CommandHandler("categories", categories_command))
+    application.add_handler(CommandHandler("contact", contact_command))
+    application.add_handler(CommandHandler("channel", channel_command))
     
     # Add button callback handler
     application.add_handler(CallbackQueryHandler(button_callback))
@@ -506,8 +495,16 @@ def main() -> None:
     # Add error handler
     application.add_error_handler(error_handler)
     
+    # Schedule hourly reminders
+    job_queue = application.job_queue
+    job_queue.run_repeating(
+        send_hourly_reminder,
+        interval=3600,  # 1 hour in seconds
+        first=10  # Start 10 seconds after bot starts
+    )
+    
     # Start polling
-    logger.info("✅ Bot is running...")
+    logger.info("✅ Bot is running with hourly reminders...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
