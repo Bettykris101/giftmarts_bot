@@ -4,7 +4,7 @@ import logging
 import asyncio
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, JobQueue
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Enable logging
 logging.basicConfig(
@@ -266,46 +266,53 @@ CATEGORIES = {
     }
 }
 
-# Send initial messages function
+# Send initial messages sequence (2 min delays)
 async def send_initial_messages(chat_id, context):
     """Send the initial 3 messages with 2-minute delays"""
     try:
-        # Message 1: Main catalog (already sent in /start)
-        
         # Wait 2 minutes, then send channel link
         await asyncio.sleep(120)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=CHANNEL_MESSAGE,
-            parse_mode="Markdown",
-            disable_web_page_preview=False
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=CHANNEL_MESSAGE,
+                parse_mode="Markdown",
+                disable_web_page_preview=False
+            )
+        except Exception as e:
+            logger.error(f"Error sending channel message to {chat_id}: {e}")
         
         # Wait 2 more minutes, then send contact info
         await asyncio.sleep(120)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=CONTACT_MESSAGE,
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=CONTACT_MESSAGE,
+                parse_mode="Markdown",
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            logger.error(f"Error sending contact message to {chat_id}: {e}")
         
     except Exception as e:
-        logger.error(f"Error sending initial messages: {e}")
+        logger.error(f"Error in send_initial_messages: {e}")
 
-# Hourly reminder function
+# Hourly reminder function - sends to ALL users
 async def send_hourly_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Send hourly reminder to all users"""
+    """Send hourly reminder to ALL subscribed users"""
     try:
         users = load_users()
         
         if not users:
-            logger.info("No users to remind")
+            logger.info("No users to remind yet")
             return
+        
+        success_count = 0
+        fail_count = 0
         
         for user_id, user_data in users.items():
             try:
-                # Send the main catalog message
+                # Send the main catalog message with buttons
                 await context.bot.send_message(
                     chat_id=int(user_id),
                     text=CATALOG_MESSAGE,
@@ -315,12 +322,22 @@ async def send_hourly_reminder(context: ContextTypes.DEFAULT_TYPE):
                 
                 # Update last reminder time
                 user_data['last_reminder'] = datetime.now().isoformat()
+                user_data['reminders_received'] = user_data.get('reminders_received', 0) + 1
+                success_count += 1
+                
+                # Small delay between messages to avoid flood limits
+                await asyncio.sleep(0.05)
                 
             except Exception as e:
                 logger.error(f"Error sending reminder to {user_id}: {e}")
+                fail_count += 1
+                # Mark user as inactive if blocked
+                if "blocked" in str(e).lower() or "deactivated" in str(e).lower():
+                    user_data['is_active'] = False
+                    user_data['blocked_at'] = datetime.now().isoformat()
         
         save_users(users)
-        logger.info(f"Hourly reminders sent to {len(users)} users")
+        logger.info(f"✅ Hourly reminders sent: {success_count} success, {fail_count} failed")
         
     except Exception as e:
         logger.error(f"Error in hourly reminder: {e}")
@@ -330,17 +347,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send welcome message and catalog"""
     user = update.effective_user
     user_id = str(user.id)
+    chat_id = update.effective_chat.id
     
-    # Register user
+    # Register user for reminders
     users = load_users()
-    if user_id not in users:
+    is_new_user = user_id not in users
+    
+    if is_new_user:
         users[user_id] = {
             "username": user.first_name or "User",
             "first_seen": datetime.now().isoformat(),
             "last_reminder": None,
-            "messages_received": 0
+            "reminders_received": 0,
+            "messages_received": 1,
+            "is_active": True
         }
-    users[user_id]["messages_received"] = users[user_id].get("messages_received", 0) + 1
+        logger.info(f"🆕 New user registered: {user.first_name} ({user_id})")
+    else:
+        users[user_id]["messages_received"] = users[user_id].get("messages_received", 0) + 1
+        users[user_id]["is_active"] = True
+        users[user_id]["username"] = user.first_name or "User"
+    
     save_users(users)
     
     # Send main catalog message with buttons
@@ -350,10 +377,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=get_main_menu_keyboard()
     )
     
-    # Start the delayed messages sequence
-    context.application.create_task(
-        send_initial_messages(update.effective_chat.id, context)
-    )
+    # Start the delayed messages sequence (only for new users)
+    if is_new_user:
+        context.application.create_task(
+            send_initial_messages(chat_id, context)
+        )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send help message"""
@@ -364,7 +392,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• /help - This menu\n"
         "• /categories - Browse categories\n"
         "• /contact - Contact admin\n"
-        "• /channel - Join our channel\n\n"
+        "• /channel - Join our channel\n"
+        "• /stop - Stop hourly reminders\n"
+        "• /resume - Resume hourly reminders\n\n"
         "🛒 *How to Order:*\n"
         "1. Browse our catalog\n"
         "2. Choose your gift card\n"
@@ -416,6 +446,73 @@ async def channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parse_mode="Markdown",
         disable_web_page_preview=False
     )
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop hourly reminders"""
+    user_id = str(update.effective_user.id)
+    users = load_users()
+    
+    if user_id in users:
+        users[user_id]["is_active"] = False
+        users[user_id]["stopped_at"] = datetime.now().isoformat()
+        save_users(users)
+        await update.message.reply_text(
+            "🔕 *Reminders stopped!*\n\n"
+            "You will no longer receive hourly updates.\n\n"
+            "To resume, use /resume",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ *You are not registered!*\n\nUse /start to register.",
+            parse_mode="Markdown"
+        )
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Resume hourly reminders"""
+    user_id = str(update.effective_user.id)
+    users = load_users()
+    
+    if user_id in users:
+        users[user_id]["is_active"] = True
+        users[user_id]["resumed_at"] = datetime.now().isoformat()
+        save_users(users)
+        await update.message.reply_text(
+            "🔔 *Reminders resumed!*\n\n"
+            "You will now receive hourly updates again.\n\n"
+            "To stop, use /stop",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ *You are not registered!*\n\nUse /start to register.",
+            parse_mode="Markdown"
+        )
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show bot statistics (admin only - add your user ID)"""
+    ADMIN_IDS = [123456789]  # Replace with your Telegram user ID
+    
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text(
+            "❌ *Access denied!*\n\nThis command is for admins only.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    users = load_users()
+    active_users = [u for u in users.values() if u.get("is_active", True)]
+    
+    stats_text = (
+        f"📊 *Bot Statistics*\n\n"
+        f"👥 Total Users: {len(users)}\n"
+        f"✅ Active Users: {len(active_users)}\n"
+        f"🔕 Stopped: {len(users) - len(active_users)}\n\n"
+        f"🕐 Hourly reminders are running"
+    )
+    
+    await update.message.reply_text(stats_text, parse_mode="Markdown")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle button presses"""
@@ -479,7 +576,7 @@ def main() -> None:
     
     logger.info("🚀 Starting Giftmart bot...")
     
-    # Create application with JobQueue for hourly reminders
+    # Create application
     application = Application.builder().token(token).build()
     
     # Add command handlers
@@ -488,6 +585,9 @@ def main() -> None:
     application.add_handler(CommandHandler("categories", categories_command))
     application.add_handler(CommandHandler("contact", contact_command))
     application.add_handler(CommandHandler("channel", channel_command))
+    application.add_handler(CommandHandler("stop", stop_command))
+    application.add_handler(CommandHandler("resume", resume_command))
+    application.add_handler(CommandHandler("stats", stats_command))
     
     # Add button callback handler
     application.add_handler(CallbackQueryHandler(button_callback))
@@ -495,16 +595,16 @@ def main() -> None:
     # Add error handler
     application.add_error_handler(error_handler)
     
-    # Schedule hourly reminders
+    # Schedule hourly reminders to ALL subscribed users
     job_queue = application.job_queue
     job_queue.run_repeating(
         send_hourly_reminder,
-        interval=3600,  # 1 hour in seconds
+        interval=3600,  # 1 hour = 3600 seconds
         first=10  # Start 10 seconds after bot starts
     )
     
     # Start polling
-    logger.info("✅ Bot is running with hourly reminders...")
+    logger.info("✅ Bot is running with hourly reminders every 1 hour...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
